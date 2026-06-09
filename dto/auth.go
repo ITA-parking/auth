@@ -5,9 +5,6 @@ type RegisterRequest struct {
 		Username string `json:"username"`
 		Email    string `json:"email"`
 		Password string `json:"password"`
-
-		PubKey     []byte `json:"pubKey"`
-		EncPrivKey []byte `json:"encPrivKey"`
 	}
 }
 
@@ -33,4 +30,10 @@ type LoginResponseBody struct {
 	TokenType    string `json:"token_type"`
 	ExpiresIn    int    `json:"expires_in"`
 	RefreshToken string `json:"refresh_token"`
+}
+
+type RefreshRequest struct {
+	Body struct {
+		RefreshToken string `json:"refresh_token"`
+	}
 }

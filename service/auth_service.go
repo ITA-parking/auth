@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"github.com/danielgtaylor/huma/v2"
@@ -25,6 +26,9 @@ const (
 	argonThreads = 4
 	argonKeyLen  = 32
 	saltLen      = 16
+
+	refreshTokenExpiry = 30 * 24 * time.Hour // 30 days
+	accessTokenExpiry  = time.Hour
 )
 
 func LoginUser(req *dto.LoginRequest) (*dto.LoginResponse, error) {
@@ -45,22 +49,22 @@ func LoginUser(req *dto.LoginRequest) (*dto.LoginResponse, error) {
 	}
 
 	if err != nil || dbUser == nil {
-		//this could technically also be an 500 internal server error due to db error
 		return nil, huma.Error404NotFound("user not found", err)
 	}
 
-	passwordValidationErr := VerifyPassword(dbUser.Password, req.Body.Password)
-	if passwordValidationErr != nil {
+	if err = VerifyPassword(dbUser.Password, req.Body.Password); err != nil {
 		return nil, huma.Error401Unauthorized("invalid password or username")
 	}
 
-	//FIXME: actually create jwt token and refresh token!!
-
-	expiresIn := time.Minute * 60
-	jwt, jwtErr := GenerateJWT(dbUser.ID, expiresIn)
+	jwt, jwtErr := GenerateJWT(dbUser.ID, accessTokenExpiry)
 	if jwtErr != nil {
 		slog.Error("Error generating JWT token", "error", jwtErr.Error())
 		return nil, huma.Error500InternalServerError("Internal Server Error", jwtErr)
+	}
+
+	refreshToken, rtErr := generateRefreshToken(context.Background(), dbUser.ID)
+	if rtErr != nil {
+		return nil, huma.Error500InternalServerError("Internal Server Error", rtErr)
 	}
 
 	return &dto.LoginResponse{
@@ -68,8 +72,8 @@ func LoginUser(req *dto.LoginRequest) (*dto.LoginResponse, error) {
 		Body: dto.LoginResponseBody{
 			AccessToken:  jwt,
 			TokenType:    "Bearer",
-			ExpiresIn:    int(expiresIn.Seconds()),
-			RefreshToken: "REFRESH_TOKEN", //TODO!!!
+			ExpiresIn:    int(accessTokenExpiry.Seconds()),
+			RefreshToken: refreshToken,
 		},
 	}, nil
 }
@@ -84,19 +88,80 @@ func RegisterNewUser(req *dto.RegisterRequest) error {
 	if hashErr != nil {
 		return huma.Error500InternalServerError("Internal Server Error", hashErr)
 	}
+
+	userID := uuid.New()
 	user := model.User{
-		ID:       uuid.New(),
+		ID:       userID,
 		Username: req.Body.Username,
 		Email:    req.Body.Email,
 		Password: passwordHash,
 	}
 
-	saveErr := repo.SaveUser(context.Background(), user)
-	if saveErr != nil {
+	if saveErr := repo.SaveUser(context.Background(), user); saveErr != nil {
 		return huma.Error500InternalServerError("Internal Server Error", saveErr)
 	}
 
 	return nil
+}
+
+func RefreshSession(req *dto.RefreshRequest) (*dto.LoginResponse, error) {
+	if req == nil || req.Body.RefreshToken == "" {
+		return nil, huma.Error400BadRequest("refresh_token is required")
+	}
+
+	stored, err := repo.FindRefreshToken(context.Background(), req.Body.RefreshToken)
+	if err != nil {
+		return nil, huma.Error500InternalServerError("Internal Server Error", err)
+	}
+	if stored == nil || stored.Revoked || time.Now().After(stored.ExpiresAt) {
+		return nil, huma.Error401Unauthorized("invalid or expired refresh token")
+	}
+
+	if err = repo.RevokeRefreshToken(context.Background(), req.Body.RefreshToken); err != nil {
+		return nil, huma.Error500InternalServerError("Internal Server Error", err)
+	}
+
+	jwt, jwtErr := GenerateJWT(stored.UserID, accessTokenExpiry)
+	if jwtErr != nil {
+		return nil, huma.Error500InternalServerError("Internal Server Error", jwtErr)
+	}
+
+	newRefreshToken, rtErr := generateRefreshToken(context.Background(), stored.UserID)
+	if rtErr != nil {
+		return nil, huma.Error500InternalServerError("Internal Server Error", rtErr)
+	}
+
+	return &dto.LoginResponse{
+		Status: http.StatusOK,
+		Body: dto.LoginResponseBody{
+			AccessToken:  jwt,
+			TokenType:    "Bearer",
+			ExpiresIn:    int(accessTokenExpiry.Seconds()),
+			RefreshToken: newRefreshToken,
+		},
+	}, nil
+}
+
+func generateRefreshToken(ctx context.Context, userID uuid.UUID) (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	tokenStr := hex.EncodeToString(b)
+
+	rt := model.RefreshToken{
+		ID:        uuid.New(),
+		Token:     tokenStr,
+		UserID:    userID,
+		ExpiresAt: time.Now().Add(refreshTokenExpiry),
+		Revoked:   false,
+	}
+
+	if err := repo.SaveRefreshToken(ctx, rt); err != nil {
+		return "", err
+	}
+
+	return tokenStr, nil
 }
 
 func validateRegisterRequest(req *dto.RegisterRequest) error {
@@ -121,15 +186,7 @@ func validateRegisterRequest(req *dto.RegisterRequest) error {
 	}
 
 	if !strings.Contains(req.Body.Email, "@") {
-		return errors.New("invalida email")
-	}
-
-	if req.Body.EncPrivKey == nil || len(req.Body.EncPrivKey) == 0 {
-		return errors.New("encrypt private key is empty")
-	}
-
-	if req.Body.PubKey == nil || len(req.Body.PubKey) == 0 {
-		return errors.New("public key is empty")
+		return errors.New("invalid email")
 	}
 
 	return nil
@@ -172,14 +229,14 @@ func VerifyPassword(encoded, password string) error {
 	}
 
 	var memory uint32
-	var time uint32
+	var iterations uint32
 	var threads uint8
 
 	_, err := fmt.Sscanf(
 		parts[3],
 		"m=%d,t=%d,p=%d",
 		&memory,
-		&time,
+		&iterations,
 		&threads,
 	)
 	if err != nil {
@@ -199,7 +256,7 @@ func VerifyPassword(encoded, password string) error {
 	hash := argon2.IDKey(
 		[]byte(password),
 		salt,
-		time,
+		iterations,
 		memory,
 		threads,
 		uint32(len(expectedHash)),
