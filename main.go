@@ -30,6 +30,10 @@ func main() {
 		// Create a new router & API
 		router := chi.NewMux()
 		router.Use(service.AuthMiddleware)
+		router.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"status":"ok","service":"auth"}`))
+		})
 		addDocs(router)
 		apiHuma := humachi.New(router, huma.DefaultConfig("Auth API", "1.0.0"))
 		api.RegisterAll(apiHuma, options)
