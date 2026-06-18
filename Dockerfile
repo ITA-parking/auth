@@ -9,5 +9,5 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /app/auth-service ./auth-service
-EXPOSE 8080
+EXPOSE 7000
 CMD ["./auth-service"]
