@@ -40,7 +40,7 @@ func main() {
 
 		// Tell the CLI how to start your router.
 		hooks.OnStart(func() {
-			runningOn := fmt.Sprintf("127.0.0.1:%d", options.HttpPort)
+			runningOn := fmt.Sprintf("0.0.0.0:%d", options.HttpPort)
 			slog.Info("Server starting on http://" + runningOn)
 			http.ListenAndServe(runningOn, router)
 		})
